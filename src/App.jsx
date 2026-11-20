@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, memo } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import { Search, Info, Clock, RotateCcw, Play, Pause, Check } from 'lucide-react';
 import * as THREE from 'three';
@@ -10,7 +10,7 @@ import CameraController from './components/CameraController';
 import LoadingScreen from './components/LoadingScreen';
 import NavControls from './components/NavControls';
 import { useSatelliteData } from './hooks/useSatelliteData';
-import { propagateSatellite, eciToEcef, ecefToGeodetic, formatCoords, getOrbitalPeriod, getSatelliteStats } from './services/propagation';
+import { propagateSatellite, ecefToGeodetic, formatCoords, getOrbitalPeriod, getSatelliteStats } from './services/propagation';
 import { SIM_STATE } from './services/simulationState';
 
 // High-performance time storage is now in services/simulationState.js
@@ -87,12 +87,6 @@ const HistoricalPanel = memo(({ selectedSat }) => {
   const [historicalTLE, setHistoricalTLE] = useState(null);
   const [fetchingHistory, setFetchingHistory] = useState(false);
 
-  // Reset when satellite changes
-  useEffect(() => {
-    setHistoricalTLE(null);
-    setHistoryDate('');
-  }, [selectedSat?.id]);
-
   const extractNoradId = (sat) => {
     if (sat.tle2 && sat.tle2.length > 7) {
       return sat.tle2.substring(2, 7).trim();
@@ -132,7 +126,7 @@ const HistoricalPanel = memo(({ selectedSat }) => {
 
     try {
       setHistoricalTLE("BACKUP SOURCE (SATCAT): NO PUBLIC HISTORY AVAILABLE");
-    } catch (e) {
+    } catch {
       setHistoricalTLE("ERROR FETCHING HISTORY");
     }
     setFetchingHistory(false);
@@ -237,34 +231,24 @@ const TelemetryPanel = memo(({ selectedSatId, satellites }) => {
       return;
     }
     const interval = setInterval(() => {
-      const pv = propagateSatellite(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime));
-      const stats = getSatelliteStats(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime));
+      const pv = propagateSatellite(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime), selectedSat.satrec);
+      const stats = getSatelliteStats(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime), selectedSat.omm, selectedSat.satrec);
       if (pv && stats) {
-        const ecf = eciToEcef(pv.position, new Date(SIM_STATE.simTime));
-        const geo = ecefToGeodetic(ecf, new Date(SIM_STATE.simTime));
+        const geo = ecefToGeodetic(pv.position, new Date(SIM_STATE.simTime));
         setTelemetry({
           ...formatCoords(geo),
           ...stats,
           eci: pv.position,
-          category: selectedSat.category,
-          noradId: extractNoradId(selectedSat)
+          category: selectedSat.category
         });
       }
     }, 500);
     return () => clearInterval(interval);
-  }, [selectedSatId, satellites]);
-
-  const extractNoradId = (sat) => {
-    // Helper to try and pull NORAD ID from TLE line 2 or ID field
-    // Standard TLE: Line 2 chars 2-7
-    if (sat.tle2 && sat.tle2.length > 7) {
-      return sat.tle2.substring(2, 7).trim();
-    }
-    return sat.id.split('-')[0];
-  };
+  }, [selectedSat]);
 
   const formatIntlId = (rawId) => {
     if (!rawId) return 'N/A';
+    if (rawId.includes('-')) return rawId;
     // Expands YYNNNPPP -> YYYY-NNNPPP (e.g. 98067A -> 1998-067A)
     const yy = parseInt(rawId.substring(0, 2), 10);
     if (!isNaN(yy)) {
@@ -438,6 +422,7 @@ function App() {
         if (noradId.includes(cleanQuery)) noradMatch = true;
       }
 
+      if (s.omm?.OBJECT_ID?.toLowerCase().includes(query)) intlMatch = true;
       if (s.tle1 && s.tle1.length > 17) {
         // Standard TLE Line 1 Intl Designator is cols 9-17 (YYNNNPPP)
         const intlId = s.tle1.substring(9, 17).trim().toLowerCase();
@@ -550,7 +535,7 @@ function App() {
                   >
                     <span style={{ fontWeight: 700, fontSize: '11px' }}>{sat.name}</span>
                     <span style={{ fontSize: '9px', color: '#888' }}>
-                      NORAD: {sat.tle2 ? sat.tle2.substring(2, 7).trim() : 'N/A'}
+                      NORAD: {sat.id}
                     </span>
                   </div>
                 ))
@@ -646,7 +631,7 @@ function App() {
                   borderRadius: '50%',
                   background: error ? '#ED1C2E' : (loading ? '#888' : (status.includes('FALLBACK') ? '#FFD700' : '#00ff00'))
                 }}></div>
-                {error ? error : (loading ? 'SYNCING CELESTRAK...' : status)}
+                {error ? error : (loading ? 'SYNCING CATALOG...' : status)}
               </div>
             </div>
           </div>
@@ -743,7 +728,7 @@ function App() {
               isSelected={true}
               isVisible={true} // Selected satellite always visible
               onClick={() => { }}
-              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === selectedSatId).tle2)}
+              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === selectedSatId).tle2, satellites.find(s => s.id === selectedSatId).omm)}
               onUpdatePosition={setSelectedSatPos}
               navMode={navMode}
             />
@@ -770,7 +755,7 @@ function App() {
                   }, 5000);
                 }
               }}
-              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === deferredHoverId).tle2)}
+              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === deferredHoverId).tle2, satellites.find(s => s.id === deferredHoverId).omm)}
               onUpdatePosition={null}
               navMode={navMode}
             />

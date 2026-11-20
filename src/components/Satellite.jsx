@@ -14,12 +14,12 @@ const CAT_COLORS = {
     DEBRIS: '#333'
 };
 
-const Satellite = ({ tle1, tle2, name, category, isSelected, isVisible, onClick, orbitalPeriod, onUpdatePosition, navMode, isHovered }) => {
+const Satellite = ({ tle1, tle2, satrec, name, category, isSelected, isVisible, onClick, orbitalPeriod, onUpdatePosition, navMode, isHovered }) => {
     const meshRef = useRef();
     const [hovered, setHovered] = useState(false);
 
     useFrame((state, delta) => {
-        const pv = propagateSatellite(tle1, tle2, new Date(SIM_STATE.simTime));
+        const pv = propagateSatellite(tle1, tle2, new Date(SIM_STATE.simTime), satrec);
         if (pv && meshRef.current) {
             const pos = pv.position;
             const x = pos.x * SCALE;
@@ -56,14 +56,14 @@ const Satellite = ({ tle1, tle2, name, category, isSelected, isVisible, onClick,
         const now = new Date(SIM_STATE.simTime);
         for (let i = 0; i <= segments; i++) {
             const time = new Date(now.getTime() + i * step * 60000);
-            const pv = propagateSatellite(tle1, tle2, time);
+            const pv = propagateSatellite(tle1, tle2, time, satrec);
             if (pv) {
                 const pos = pv.position;
                 path.push([pos.x * SCALE, pos.z * SCALE, -pos.y * SCALE]);
             }
         }
         return path;
-    }, [tle1, tle2, isSelected, orbitalPeriod]);
+    }, [tle1, tle2, satrec, isSelected, orbitalPeriod]);
 
     const color = (isSelected || hovered || isHovered) ? '#ED1C2E' : (CAT_COLORS[category] || '#444');
 

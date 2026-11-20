@@ -1,118 +1,87 @@
+import process from 'node:process';
 import fs from 'fs';
 import path from 'path';
+import { gzipSync } from 'node:zlib';
 
 const CACHE_DURATION = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
-const CACHE_FILE = path.join('/tmp', 'satellite-data-cache.json');
+const CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-spacebook-cache-v1.json');
+const FALLBACK_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-cache-v1.json');
+let refreshPromise;
+let fallbackPromise;
+const RATE_LIMIT_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-rate-limit.json');
+const RATE_LIMIT_DELAY = 2 * 60 * 60 * 1000;
 
-const GROUP_MAP = [
-    { key: 'stations', label: 'STATION' },
-    { key: 'starlink', label: 'PAYLOAD' },
-    { key: 'oneweb', label: 'PAYLOAD' },
-    { key: 'iridium-NEXT', label: 'PAYLOAD' },
-    { key: 'gps-ops', label: 'PAYLOAD' },
-    { key: 'glo-ops', label: 'PAYLOAD' },
-    { key: 'beidou', label: 'PAYLOAD' },
-    { key: 'galileo', label: 'PAYLOAD' },
-    { key: 'planet', label: 'PAYLOAD' },
-    { key: 'spire', label: 'PAYLOAD' },
-    { key: 'weather', label: 'PAYLOAD' },
-    { key: 'noaa', label: 'PAYLOAD' },
-    { key: 'goes', label: 'PAYLOAD' },
-    { key: 'resource', label: 'PAYLOAD' },
-    { key: 'science', label: 'PAYLOAD' },
-    { key: 'active', label: 'PAYLOAD' },
-    { key: 'cosmos-1408-debris', label: 'DEBRIS' },
-    { key: 'fengyun-1c-debris', label: 'DEBRIS' },
-    { key: 'iridium-33-debris', label: 'DEBRIS' },
-    { key: 'cosmos-2251-debris', label: 'DEBRIS' }
-];
+const OMM_FIELDS = ['NORAD_CAT_ID', 'OBJECT_NAME', 'OBJECT_ID', 'OBJECT_TYPE', 'EPOCH', 'MEAN_MOTION', 'ECCENTRICITY', 'INCLINATION', 'RA_OF_ASC_NODE', 'ARG_OF_PERICENTER', 'MEAN_ANOMALY', 'BSTAR', 'MEAN_MOTION_DOT', 'MEAN_MOTION_DDOT'];
 
-const validateTLEChecksum = (line) => {
-    if (!line || line.length < 69) return false;
-    const check = line[68];
-    let sum = 0;
-    for (let i = 0; i < 68; i++) {
-        const char = line[i];
-        if (char >= '0' && char <= '9') sum += parseInt(char);
-        else if (char === '-') sum += 1;
+function compactRecords(records, minimum) {
+    if (!Array.isArray(records) || records.length < minimum) throw new Error('Catalog response is incomplete');
+    const ids = new Set();
+    const valid = [];
+    for (const record of records) {
+        if (!record.NORAD_CAT_ID || !record.EPOCH || !Number.isFinite(Date.parse(record.EPOCH)) || !Number(record.MEAN_MOTION) || ['ECCENTRICITY', 'INCLINATION', 'RA_OF_ASC_NODE', 'ARG_OF_PERICENTER', 'MEAN_ANOMALY', 'BSTAR'].some(field => record[field] == null || !Number.isFinite(Number(record[field]))) || ids.has(String(record.NORAD_CAT_ID))) continue;
+        ids.add(String(record.NORAD_CAT_ID));
+        valid.push(OMM_FIELDS.map(field => record[field] ?? null));
     }
-    return (sum % 10) === parseInt(check);
-};
+    if (valid.length < minimum || valid.length < records.length * 0.95) throw new Error('Catalog contains too many invalid records');
+    return valid;
+}
 
-const parseSingleTLE = (name, tle1, tle2, categoryLabel) => {
-    if (!validateTLEChecksum(tle1) || !validateTLEChecksum(tle2)) return null;
-    const noradId = tle2.substring(2, 7).trim();
-    let category = 'PAYLOAD';
-    if (categoryLabel === 'STATION' || name.includes('ISS') || name.includes('CSS') || name.includes('TIANGONG')) {
-        category = 'STATION';
-    } else if (categoryLabel === 'DEBRIS' || name.includes('DEB') || name.includes('R/B')) {
-        category = 'DEBRIS';
+export async function fetchActiveCatalog() {
+    const response = await fetch('https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=JSON', { signal: AbortSignal.timeout(10000), redirect: 'manual' });
+    if (response.status === 403) {
+        try { fs.writeFileSync(RATE_LIMIT_FILE, JSON.stringify({ until: Date.now() + RATE_LIMIT_DELAY })); } catch { /* Cache is optional. */ }
+        throw new Error('CelesTrak rate limit reached; retry after its next update (up to two hours)');
     }
+    if (!response.ok) throw new Error(`CelesTrak request failed (HTTP ${response.status})`);
+    return compactRecords(await response.json(), 1);
+}
 
-    return {
-        name: name.trim(),
-        tle1: tle1.trim(),
-        tle2: tle2.trim(),
-        id: noradId,
-        category
-    };
-};
-
-const parseBulkTLE = (text, categoryLabel) => {
-    const lines = text.trim().split(/\r?\n/);
-    const sats = [];
-    for (let i = 0; i < lines.length; i += 3) {
-        if (i + 2 >= lines.length) break;
-        const sat = parseSingleTLE(lines[i], lines[i + 1], lines[i + 2], categoryLabel);
-        if (sat) sats.push(sat);
-    }
-    return sats;
-};
-
-const fetchGroupData = async (group) => {
-    const urls = [
-        `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group.key}&FORMAT=TLE`,
-        `https://celestrak.org/NORAD/elements/${group.key}.txt`
-    ];
-
-    for (const url of urls) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-            const response = await fetch(url, {
-                signal: controller.signal,
-                headers: {
-                    'User-Agent': 'Space-Traffic-Model/1.0'
-                }
-            });
-
-            clearTimeout(timeout);
-
-            if (response.ok) {
-                const text = await response.text();
-                if (text && text.length > 50) {
-                    const sats = parseBulkTLE(text, group.label);
-                    if (sats.length > 0) {
-                        console.log(`[API] Fetched ${sats.length} satellites from ${group.key}`);
-                        return sats;
-                    }
-                }
-            }
-        } catch (error) {
-            console.error(`[API] Error fetching ${group.key}:`, error.message);
+// Spacebook publishes a bulk TLE catalog, with or without an optional name line.
+export function parseTleCatalog(text, minimum = 10000) {
+    const lines = text.split(/\r?\n/).map(line => line.trimEnd()).filter(line => line.trim());
+    const records = [];
+    const ids = new Set();
+    let invalid = 0;
+    let name = '';
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.startsWith('1 ')) {
+            if (line.startsWith('2 ')) invalid++;
+            else name = line.replace(/^0 /, '').trim();
+            continue;
         }
+        const line2 = lines[++i] || '';
+        const rawId = line.slice(2, 7).trim();
+        const match = /^([A-HJ-NP-Z])(\d{4})$/.exec(rawId);
+        const id = match ? String(('ABCDEFGHJKLMNPQRSTUVWXYZ'.indexOf(match[1]) + 10) * 10000 + Number(match[2])) : rawId;
+        const epoch = Number(line.slice(18, 32));
+        const meanMotion = Number(line2.slice(52, 63));
+        const fieldsValid = [line2.slice(8, 16), line2.slice(17, 25), line2.slice(34, 42), line2.slice(43, 51)].every(value => value.trim() && Number.isFinite(Number(value)));
+        if (line.length < 69 || line2.length < 69 || !line2.startsWith('2 ') || line2.slice(2, 7).trim() !== rawId || !/^\d+$/.test(id) || !Number.isFinite(epoch) || !epoch || !Number.isFinite(meanMotion) || meanMotion <= 0 || !fieldsValid || !/^\d{7}$/.test(line2.slice(26, 33)) || ids.has(id)) {
+            invalid++;
+        } else {
+            ids.add(id);
+            records.push([id, name || `OBJECT ${id}`, line, line2]);
+        }
+        name = '';
     }
-    return [];
-};
+    if (records.length < minimum || invalid > (records.length + invalid) * 0.05) throw new Error('Spacebook catalog is incomplete or invalid');
+    return records;
+}
 
-const loadCache = () => {
+export async function fetchFullCatalog() {
+    const response = await fetch('https://spacebook.comspoc.com/api/entity/tle', { signal: AbortSignal.timeout(50000) });
+    if (!response.ok) throw new Error(`Spacebook catalog request failed (HTTP ${response.status})`);
+    return parseTleCatalog(await response.text());
+}
+
+const loadCache = (file = CACHE_FILE, source = 'spacebook') => {
     try {
-        if (fs.existsSync(CACHE_FILE)) {
-            const cacheData = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+        if (fs.existsSync(file)) {
+            const cacheData = JSON.parse(fs.readFileSync(file, 'utf8'));
             const age = Date.now() - cacheData.timestamp;
 
-            if (age < CACHE_DURATION) {
+            if (cacheData.source === source && Array.isArray(cacheData.data) && cacheData.data.length >= (source === 'spacebook' ? 10000 : 1)) {
                 console.log(`[API] Cache hit - age: ${Math.round(age / 3600000)}h, satellites: ${cacheData.data.length}`);
                 return cacheData;
             } else {
@@ -125,13 +94,14 @@ const loadCache = () => {
     return null;
 };
 
-const saveCache = (data) => {
+const saveCache = (data, file = CACHE_FILE, source = 'spacebook') => {
     try {
         const cacheData = {
             data,
+            source,
             timestamp: Date.now()
         };
-        fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData), 'utf8');
+        fs.writeFileSync(file, JSON.stringify(cacheData), 'utf8');
         console.log(`[API] Cached ${data.length} satellites`);
     } catch (error) {
         console.error('[API] Cache write error:', error.message);
@@ -152,53 +122,50 @@ export default async function handler(req, res) {
         return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    try {
-        // Check cache first
-        const cached = loadCache();
-        if (cached) {
-            return res.status(200).json({
-                satellites: cached.data,
-                cached: true,
-                timestamp: cached.timestamp,
-                age: Date.now() - cached.timestamp
-            });
+    const sendCatalog = payload => {
+        res.setHeader('Cache-Control', 'no-store');
+        if (/\bgzip\b/.test(req.headers?.['accept-encoding'] || '')) {
+            res.setHeader('Content-Encoding', 'gzip');
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Vary', 'Accept-Encoding');
+            return res.status(200).end(gzipSync(JSON.stringify(payload)));
         }
+        return res.status(200).json(payload);
+    };
 
-        // Fetch fresh data
-        console.log('[API] Fetching fresh satellite data...');
-        const allSatellites = [];
-        const seenIds = new Set();
-
-        // Fetch all groups in parallel
-        const results = await Promise.all(GROUP_MAP.map(group => fetchGroupData(group)));
-
-        // Deduplicate satellites
-        for (const groupSats of results) {
-            for (const sat of groupSats) {
-                if (!seenIds.has(sat.id)) {
-                    seenIds.add(sat.id);
-                    allSatellites.push(sat);
-                }
+    try {
+        const cached = loadCache();
+        if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+            return sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, timestamp: cached.timestamp });
+        }
+        try {
+            if (!refreshPromise) refreshPromise = fetchFullCatalog().finally(() => { refreshPromise = null; });
+            const data = await refreshPromise;
+            if (cached && data.length < cached.data.length * 0.8) throw new Error('Catalog shrank unexpectedly');
+            saveCache(data);
+            return sendCatalog({ satellites: data, source: 'spacebook', cached: false, timestamp: Date.now() });
+        } catch (error) {
+            console.error('[API] Catalog refresh failed:', error.message);
+            if (cached) return sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, stale: true, timestamp: cached.timestamp });
+            // Active satellites are a subset, so never label or save this as a full catalog.
+            const fallback = loadCache(FALLBACK_CACHE_FILE, 'celestrak-active');
+            if (fallback && Date.now() - fallback.timestamp < CACHE_DURATION) {
+                return sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, timestamp: fallback.timestamp });
+            }
+            try {
+                let blockedUntil = 0;
+                try { blockedUntil = JSON.parse(fs.readFileSync(RATE_LIMIT_FILE, 'utf8')).until || 0; } catch { /* No previous rate limit. */ }
+                if (blockedUntil > Date.now()) throw new Error('CelesTrak rate limit reached; retry after its next update (up to two hours)');
+                if (!fallbackPromise) fallbackPromise = fetchActiveCatalog().finally(() => { fallbackPromise = null; });
+                const data = await fallbackPromise;
+                saveCache(data, FALLBACK_CACHE_FILE, 'celestrak-active');
+                return sendCatalog({ satellites: data, source: 'celestrak-active', cached: false, timestamp: Date.now() });
+            } catch (fallbackError) {
+                console.error('[API] Active catalog failed:', fallbackError.message);
+                if (fallback) return sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, stale: true, timestamp: fallback.timestamp });
+                return res.status(503).json({ error: `Spacebook: ${error.message}. CelesTrak: ${fallbackError.message}` });
             }
         }
-
-        if (allSatellites.length === 0) {
-            return res.status(503).json({
-                error: 'Failed to fetch satellite data from all sources',
-                satellites: [],
-                cached: false
-            });
-        }
-
-        // Save to cache
-        saveCache(allSatellites);
-
-        return res.status(200).json({
-            satellites: allSatellites,
-            cached: false,
-            timestamp: Date.now(),
-            count: allSatellites.length
-        });
 
     } catch (error) {
         console.error('[API] Handler error:', error);
