@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
+import { Vector3 } from 'three';
 import { Search, Info, Clock, RotateCcw, Play, Pause, Check } from 'lucide-react';
 import Earth from './components/Earth';
 import Satellite from './components/Satellite';
@@ -10,57 +11,18 @@ import LoadingScreen from './components/LoadingScreen';
 import NavControls from './components/NavControls';
 import { useSatelliteData } from './hooks/useSatelliteData';
 import { createSatrec, propagateSatellite, ecefToGeodetic, formatCoords, getOrbitalPeriod, getSatelliteStats } from './services/propagation';
-import { SIM_STATE, setSimulationSpeed, setSimulationPaused, resetSimulationTime } from './services/simulationState';
-
-// High-performance time storage is now in services/simulationState.js
-
-const SunLight = () => {
-  const lightRef = useRef();
-  useFrame(() => {
-    if (lightRef.current) {
-      const date = new Date(SIM_STATE.simTime);
-      // ECI Frame: Sun moves ~1 degree per day (Annual orbit), not per hour
-      // Calculate approximate Right Ascension (RA) of Sun based on day of year
-      const start = new Date(date.getUTCFullYear(), 0, 0);
-      const diff = date - start;
-      const oneDay = 1000 * 60 * 60 * 24;
-      const dayOfYear = diff / oneDay;
-
-      // Vernal Equinox (~March 20, Day 79) is RA 0 (Angle 0)
-      // We adjust phase so Day 79 ~= 0 radians
-      // OFFSET: Adding Math.PI (180 deg) because the Earth texture/rotation vs Sun seems flipped 180 degrees
-      // (Fixes "America Midday when it should be Night" issue)
-      const angle = ((dayOfYear - 79) / 365.25) * Math.PI * 2 + Math.PI;
-
-      // Distance far enough to be directional
-      const distance = 100;
-      lightRef.current.position.set(Math.cos(angle) * distance, 0, Math.sin(angle) * distance);
-    }
-  });
-  return (
-    <>
-      <directionalLight ref={lightRef} intensity={5.5} />
-      <hemisphereLight intensity={0.8} groundColor="#000000" color="#ffffff" />
-    </>
-  );
-};
+import { SIM_STATE, updateSimulationTime, setSimulationSpeed, setSimulationPaused, resetSimulationTime } from './services/simulationState';
+import { setSunDirection } from './services/solarPosition';
 
 const SimulationManager = () => {
-  useFrame((state, delta) => {
-    const now = Date.now();
-    SIM_STATE.realTime = now;
-    if (!SIM_STATE.paused) {
-      SIM_STATE.simTime += delta * 1000 * SIM_STATE.speed;
-    }
-  }, -3);
+  useFrame(() => updateSimulationTime(), -3);
   return null;
 };
 
-// UI component that only updates once in a while
 const ClockDisplay = () => {
   const [, setTick] = useState(0);
   useEffect(() => {
-    const interval = setInterval(() => setTick(t => t + 1), 1000);
+    const interval = setInterval(() => setTick(t => t + 1), 100);
     return () => clearInterval(interval);
   }, []);
 
@@ -306,6 +268,12 @@ const TelemetryPanel = memo(({ selectedSat, satrec }) => {
 });
 
 function App() {
+  const initialCamera = useMemo(() => {
+    const sun = setSunDirection(new Vector3(), new Date(SIM_STATE.simTime), 1);
+    // Look along the terminator at startup with the illuminated side on the right.
+    const position = new Vector3(-sun.z, 0, sun.x).setLength(3).toArray();
+    return { position, fov: 45 };
+  }, []);
   const { satellites, loading, error, status } = useSatelliteData();
   const [selectedSatId, setSelectedSatId] = useState(null);
   const selectedSat = useMemo(() => selectedSatId === null ? null : satellites.find(s => s.id === selectedSatId),
@@ -392,9 +360,9 @@ function App() {
   };
 
   const resetToRealTime = () => {
-    resetSimulationTime();
     setSpeed(1);
     setPaused(false);
+    resetSimulationTime();
   };
 
   const triggerZoom = (factor, reset = false) => {
@@ -692,10 +660,9 @@ function App() {
       </div>
 
       <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 1 }}>
-        <Canvas camera={{ position: [0, 0, 3], fov: 45 }}>
+        <Canvas camera={initialCamera}>
           <color attach="background" args={['#111']} />
           <SimulationManager />
-          <SunLight />
           <Earth />
 
           <SatellitesInstanced
