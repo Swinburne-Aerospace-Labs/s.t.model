@@ -34,13 +34,17 @@ test('simultaneous requests share one CelesTrak download and cache it', async ()
 });
 
 test('enriches unnamed objects in an existing Spacebook cache by NORAD ID', async () => {
-  const ids = ['25544', '48274', '00005', '00016', '100001', '100002'];
+  const ids = ['25544', '48274', '00005', '00016', '100001', '100002', '100003', '100004'];
   const rows = ids.map(id => [id, `OBJECT ${id}`, 'tle1', 'tle2']);
+  rows[7][1] = 'ORIGINAL NAME';
   const data = [...rows, ...Array.from({ length: 10000 - rows.length }, (_, index) => [
     String(index + 110000), 'UNKNOWN', 'tle1', 'tle2',
   ])];
   fs.writeFileSync(path.join(dir, 'satellite-spacebook-cache-v1.json'), JSON.stringify({
     source: 'spacebook', timestamp: Date.now(), data,
+  }));
+  fs.writeFileSync(path.join(dir, 'satellite-object-types-v1.json'), JSON.stringify({
+    source: 'celestrak-satcat', timestamp: Date.now(), data: [['25544', 'PAY']],
   }));
   const original = globalThis.fetch;
   let calls = 0;
@@ -53,7 +57,9 @@ test('enriches unnamed objects in an existing Spacebook cache by NORAD ID', asyn
       'VANGUARD 1,1958-002B,5,PAY,',
       '"VANGUARD, ""STAGE""",1958-002A,16,R/B,',
       'TEST DEBRIS,,100001,DEB,',
-      'UNKNOWN,,100002,UNK,',
+      'STARLINK-TEST,,100002,PAY,+',
+      'NAMED OBJECT,,100003,UNK,',
+      'ALTERNATE NAME,,100004,PAY,',
     ].join('\r\n'));
   };
   try {
@@ -62,10 +68,19 @@ test('enriches unnamed objects in an existing Spacebook cache by NORAD ID', asyn
     assert.equal(calls, 1);
     assert.equal(one.body.cached, true);
     assert.equal(two.body.hasObjectTypes, true);
+    assert.equal(two.body.hasObjectNames, true);
     const objects = processCatalog(two.body.satellites.slice(0, ids.length), 'spacebook');
     assert.deepEqual(objects.map(object => object.id), ids);
     assert.deepEqual(objects.map(object => object.category), [
-      'STATION', 'STATION', 'PAYLOAD', 'DEBRIS', 'DEBRIS', 'PAYLOAD',
+      'STATION', 'STATION', 'PAYLOAD', 'DEBRIS', 'DEBRIS', 'PAYLOAD', 'PAYLOAD', 'PAYLOAD',
     ]);
+    assert.deepEqual(objects.map(object => object.name), [
+      'ISS (ZARYA)', 'OBJECT 48274', 'VANGUARD 1', 'VANGUARD, "STAGE"',
+      'TEST DEBRIS', 'STARLINK-TEST', 'NAMED OBJECT', 'ORIGINAL NAME',
+    ]);
+    const three = response();
+    await handler({ method: 'GET' }, three);
+    assert.equal(calls, 1);
+    assert.deepEqual(three.body.satellites, two.body.satellites);
   } finally { globalThis.fetch = original; }
 });

@@ -6,6 +6,12 @@ export function catalogKey(id) {
     return String(id).replace(/^0+(?=\d)/, '');
 }
 
+export function hasCatalogName(name, id) {
+    const value = name?.trim();
+    if (!value || /^UNKNOWN$/i.test(value)) return false;
+    return catalogKey(value.replace(/^OBJECT\s+/i, '')) !== catalogKey(id);
+}
+
 function classifyObject(id, name, objectType) {
     if (STATION_IDS.has(catalogKey(id))) return 'STATION';
     const type = (objectType || '').trim().toUpperCase();
@@ -17,13 +23,14 @@ function classifyObject(id, name, objectType) {
 export function processCatalog(rows, source) {
     return rows.map(row => {
         if (source === 'spacebook') {
-            const [id, name, tle1, tle2, type] = row;
+            const [id, rawName, tle1, tle2, type] = row;
+            const name = hasCatalogName(rawName, id) ? rawName.trim() : `OBJECT ${id}`;
             return { id: String(id), name, category: classifyObject(id, name, type), tle1, tle2 };
         }
         const omm = {};
         for (let i = 0; i < FIELDS.length; i++) omm[FIELDS[i]] = row[i];
         const id = String(omm.NORAD_CAT_ID);
-        const name = omm.OBJECT_NAME || `OBJECT ${id}`;
+        const name = hasCatalogName(omm.OBJECT_NAME, id) ? omm.OBJECT_NAME.trim() : `OBJECT ${id}`;
         return { id, name, category: classifyObject(id, name, omm.OBJECT_TYPE), omm };
     });
 }

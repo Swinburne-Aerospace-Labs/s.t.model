@@ -2,17 +2,17 @@ import process from 'node:process';
 import fs from 'fs';
 import path from 'path';
 import { gzipSync } from 'node:zlib';
-import { catalogKey } from '../src/services/catalog.js';
+import { catalogKey, hasCatalogName } from '../src/services/catalog.js';
 
 const CACHE_DURATION = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
 const CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-spacebook-cache-v1.json');
 const FALLBACK_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-cache-v1.json');
-const OBJECT_TYPES_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-object-types-v1.json');
+const SATCAT_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-object-types-v1.json');
 let refreshPromise;
 let fallbackPromise;
-let objectTypesPromise;
-let objectTypesCache;
-let nextObjectTypesAttempt = 0;
+let satcatPromise;
+let satcatCache;
+let nextSatcatAttempt = 0;
 const RATE_LIMIT_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-rate-limit.json');
 const RATE_LIMIT_DELAY = 2 * 60 * 60 * 1000;
 
@@ -80,7 +80,7 @@ export async function fetchFullCatalog() {
     return parseTleCatalog(await response.text());
 }
 
-export function parseObjectTypes(csv) {
+function parseSatcat(csv) {
     const [header, ...rows] = csv.trim().split(/\r?\n/);
     if (!header.startsWith('OBJECT_NAME,OBJECT_ID,NORAD_CAT_ID,OBJECT_TYPE,')) {
         throw new Error('Unexpected CelesTrak SATCAT format');
@@ -88,10 +88,14 @@ export function parseObjectTypes(csv) {
     const entries = [];
     for (const row of rows) {
         // The name can be quoted and contain commas or escaped quotes.
-        const match = /^(?:"(?:[^"]|"")*"|[^,]*),[^,]*,(\d+),(PAY|R\/B|DEB),/.exec(row);
-        if (match) entries.push([catalogKey(match[1]), match[2]]);
+        const match = /^(?:"((?:[^"]|"")*)"|([^,]*)),[^,]*,(\d+),(PAY|R\/B|DEB|UNK),/.exec(row);
+        if (match) {
+            const [, quotedName, plainName, id, type] = match;
+            const name = (quotedName?.replace(/""/g, '"') ?? plainName).trim();
+            entries.push([catalogKey(id), type === 'UNK' ? null : type, name]);
+        }
     }
-    if (!entries.length) throw new Error('CelesTrak SATCAT contains no object types');
+    if (!entries.length) throw new Error('CelesTrak SATCAT contains no object records');
     return entries;
 }
 
@@ -128,34 +132,40 @@ const saveCache = (data, file = CACHE_FILE, source = 'spacebook') => {
     }
 };
 
-async function loadObjectTypes() {
+async function loadSatcat() {
     const source = 'celestrak-satcat';
-    if (objectTypesCache === undefined) {
-        const cached = loadCache(OBJECT_TYPES_CACHE_FILE, source);
-        objectTypesCache = null;
-        if (cached?.data.every(entry => Array.isArray(entry) && entry.length === 2)) {
-            objectTypesCache = new Map(cached.data);
-            nextObjectTypesAttempt = cached.timestamp + CACHE_DURATION;
+    if (satcatCache === undefined) {
+        const cached = loadCache(SATCAT_CACHE_FILE, source);
+        satcatCache = null;
+        if (cached?.data.every(entry => Array.isArray(entry) && (entry.length === 2 || entry.length === 3))) {
+            satcatCache = {
+                objects: new Map(cached.data.map(([id, type, name]) => [id, { type, name }])),
+                hasNames: cached.data.every(entry => entry.length === 3),
+            };
+            if (satcatCache.hasNames) nextSatcatAttempt = cached.timestamp + CACHE_DURATION;
         }
     }
-    if (Date.now() < nextObjectTypesAttempt) return objectTypesCache;
-    if (!objectTypesPromise) {
-        objectTypesPromise = (async () => {
+    if (Date.now() < nextSatcatAttempt) return satcatCache;
+    if (!satcatPromise) {
+        satcatPromise = (async () => {
             try {
                 const response = await fetch('https://celestrak.org/pub/satcat.csv', { signal: AbortSignal.timeout(8000) });
                 if (!response.ok) throw new Error(`CelesTrak SATCAT request failed (HTTP ${response.status})`);
-                const data = parseObjectTypes(await response.text());
-                objectTypesCache = new Map(data);
-                nextObjectTypesAttempt = Date.now() + CACHE_DURATION;
-                saveCache(data, OBJECT_TYPES_CACHE_FILE, source);
+                const data = parseSatcat(await response.text());
+                satcatCache = {
+                    objects: new Map(data.map(([id, type, name]) => [id, { type, name }])),
+                    hasNames: true,
+                };
+                nextSatcatAttempt = Date.now() + CACHE_DURATION;
+                saveCache(data, SATCAT_CACHE_FILE, source);
             } catch (error) {
-                console.error('[API] Object type refresh failed:', error.message);
-                nextObjectTypesAttempt = Date.now() + RATE_LIMIT_DELAY;
+                console.error('[API] SATCAT refresh failed:', error.message);
+                nextSatcatAttempt = Date.now() + RATE_LIMIT_DELAY;
             }
-            return objectTypesCache;
-        })().finally(() => { objectTypesPromise = null; });
+            return satcatCache;
+        })().finally(() => { satcatPromise = null; });
     }
-    return objectTypesPromise;
+    return satcatPromise;
 }
 
 export default async function handler(req, res) {
@@ -174,12 +184,16 @@ export default async function handler(req, res) {
 
     const sendCatalog = async payload => {
         if (payload.source === 'spacebook') {
-            const types = await loadObjectTypes();
-            if (types) {
+            const satcat = await loadSatcat();
+            if (satcat) {
                 payload.hasObjectTypes = true;
-                payload.satellites = payload.satellites.map(row => {
-                    const type = types.get(catalogKey(row[0]));
-                    return type ? [...row, type] : row;
+                payload.hasObjectNames = satcat.hasNames;
+                payload.satellites = payload.satellites.map(([id, name, tle1, tle2, type]) => {
+                    const metadata = satcat.objects.get(catalogKey(id));
+                    const displayName = hasCatalogName(name, id) || !hasCatalogName(metadata?.name, id)
+                        ? name
+                        : metadata.name;
+                    return [id, displayName, tle1, tle2, metadata?.type ?? type];
                 });
             }
         }

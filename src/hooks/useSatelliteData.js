@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { processCatalog } from '../services/catalog';
+import { catalogKey, hasCatalogName, processCatalog } from '../services/catalog';
 
 const EXPIRY = 12 * 60 * 60 * 1000;
 
@@ -49,7 +49,7 @@ export const useSatelliteData = () => {
                 try { show(cached, !cached.stale && Date.now() - cached.timestamp < EXPIRY ? 'CACHED' : 'STALE CACHE'); }
                 catch (err) { console.warn('Catalog cache invalid', err); cached = null; }
             }
-            if (cached?.source === 'spacebook' && cached.hasObjectTypes && !cached.stale && Date.now() - cached.timestamp < EXPIRY) return;
+            if (cached?.source === 'spacebook' && cached.hasObjectNames && !cached.stale && Date.now() - cached.timestamp < EXPIRY) return;
             try {
                 const response = await fetch('/api/satellites', { signal: AbortSignal.timeout(65000) });
                 const result = await response.json();
@@ -59,11 +59,15 @@ export const useSatelliteData = () => {
                     if (!cancelled) setStatus(`OFFLINE: STALE CATALOG (${cached.satellites.length.toLocaleString()} OBJECTS)`);
                     return;
                 }
-                if (result.source === 'spacebook' && !result.hasObjectTypes && cached?.source === 'spacebook') {
-                    const lastKnownTypes = new Map(cached.satellites.filter(row => row[4]).map(row => [row[0], row[4]]));
-                    result.satellites = result.satellites.map(row => {
-                        const type = lastKnownTypes.get(row[0]);
-                        return type ? [...row, type] : row;
+                if (result.source === 'spacebook' && cached?.source === 'spacebook' && (!result.hasObjectNames || !result.hasObjectTypes)) {
+                    const lastKnown = new Map(cached.satellites.map(row => [catalogKey(row[0]), row]));
+                    result.satellites = result.satellites.map(([id, name, tle1, tle2, type]) => {
+                        const previous = lastKnown.get(catalogKey(id));
+                        if (!previous) return [id, name, tle1, tle2, type];
+                        const displayName = hasCatalogName(name, id) || !hasCatalogName(previous[1], id)
+                            ? name
+                            : previous[1];
+                        return [id, displayName, tle1, tle2, type ?? previous[4]];
                     });
                 }
                 show(result, result.stale ? 'STALE CACHE' : 'ACTIVE');
