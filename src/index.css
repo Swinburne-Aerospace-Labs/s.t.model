@@ -36,8 +36,7 @@ body {
   left: 0;
   width: 300px;
   height: 100vh;
-  background: rgba(17, 17, 17, 0.9);
-  backdrop-filter: blur(20px);
+  background: rgba(17, 17, 17, 0.97);
   border-right: 1px solid #333;
   padding: 20px;
   box-sizing: border-box;
@@ -45,6 +44,10 @@ body {
   flex-direction: column;
   z-index: 10;
   overflow-y: auto;
+}
+
+.dashboard > * {
+  flex-shrink: 0;
 }
 
 .controls {

@@ -2,6 +2,14 @@ import * as satellite from 'satellite.js';
 
 export const EARTH_RADIUS = 6371; // km
 
+export const createSatrec = ({ tle1, tle2, omm }) => {
+    try {
+        return omm ? satellite.json2satrec(omm) : satellite.twoline2satrec(tle1, tle2);
+    } catch {
+        return null;
+    }
+};
+
 /**
  * Propagates a satellite's position at a given time.
  * @param {string} tle1 
@@ -14,11 +22,10 @@ export const propagateSatellite = (tle1, tle2, time, existingSatrec) => {
         const satrec = existingSatrec || satellite.twoline2satrec(tle1, tle2);
         const positionAndVelocity = satellite.propagate(satrec, time);
 
-        if (!positionAndVelocity.position) return null;
+        if (!positionAndVelocity?.position) return null;
 
         return positionAndVelocity;
-    } catch (error) {
-        // console.error("Propagation error:", error);
+    } catch {
         return null;
     }
 };
@@ -103,7 +110,7 @@ export const getSatelliteStats = (tle1, tle2, time = new Date(), omm, existingSa
             intlId,
             period: getOrbitalPeriod(tle2, omm).toFixed(2)
         };
-    } catch (e) {
+    } catch {
         return null;
     }
 };

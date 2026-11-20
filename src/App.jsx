@@ -1,8 +1,7 @@
-import React, { useState, useEffect, useRef, memo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import { Search, Info, Clock, RotateCcw, Play, Pause, Check } from 'lucide-react';
-import * as THREE from 'three';
 import Earth from './components/Earth';
 import Satellite from './components/Satellite';
 import SatellitesInstanced from './components/SatellitesInstanced';
@@ -10,8 +9,8 @@ import CameraController from './components/CameraController';
 import LoadingScreen from './components/LoadingScreen';
 import NavControls from './components/NavControls';
 import { useSatelliteData } from './hooks/useSatelliteData';
-import { propagateSatellite, ecefToGeodetic, formatCoords, getOrbitalPeriod, getSatelliteStats } from './services/propagation';
-import { SIM_STATE } from './services/simulationState';
+import { createSatrec, propagateSatellite, ecefToGeodetic, formatCoords, getOrbitalPeriod, getSatelliteStats } from './services/propagation';
+import { SIM_STATE, setSimulationSpeed, setSimulationPaused, resetSimulationTime } from './services/simulationState';
 
 // High-performance time storage is now in services/simulationState.js
 
@@ -53,7 +52,7 @@ const SimulationManager = () => {
     if (!SIM_STATE.paused) {
       SIM_STATE.simTime += delta * 1000 * SIM_STATE.speed;
     }
-  });
+  }, -3);
   return null;
 };
 
@@ -220,21 +219,17 @@ const HistoricalPanel = memo(({ selectedSat }) => {
   );
 });
 
-const TelemetryPanel = memo(({ selectedSatId, satellites }) => {
+const TelemetryPanel = memo(({ selectedSat, satrec }) => {
   const [telemetry, setTelemetry] = useState(null);
-  const selectedSat = satellites.find(s => s.id === selectedSatId);
 
-  // Reset history when satellite changes
   useEffect(() => {
-    if (!selectedSat) {
-      setTelemetry(null);
-      return;
-    }
+    if (!selectedSat || !satrec) return;
     const interval = setInterval(() => {
-      const pv = propagateSatellite(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime), selectedSat.satrec);
-      const stats = getSatelliteStats(selectedSat.tle1, selectedSat.tle2, new Date(SIM_STATE.simTime), selectedSat.omm, selectedSat.satrec);
+      const time = new Date(SIM_STATE.simTime);
+      const pv = propagateSatellite(selectedSat.tle1, selectedSat.tle2, time, satrec);
+      const stats = pv && getSatelliteStats(selectedSat.tle1, selectedSat.tle2, time, selectedSat.omm, satrec);
       if (pv && stats) {
-        const geo = ecefToGeodetic(pv.position, new Date(SIM_STATE.simTime));
+        const geo = ecefToGeodetic(pv.position, time);
         setTelemetry({
           ...formatCoords(geo),
           ...stats,
@@ -244,7 +239,7 @@ const TelemetryPanel = memo(({ selectedSatId, satellites }) => {
       }
     }, 500);
     return () => clearInterval(interval);
-  }, [selectedSat]);
+  }, [selectedSat, satrec]);
 
   const formatIntlId = (rawId) => {
     if (!rawId) return 'N/A';
@@ -313,31 +308,47 @@ const TelemetryPanel = memo(({ selectedSatId, satellites }) => {
 function App() {
   const { satellites, loading, error, status } = useSatelliteData();
   const [selectedSatId, setSelectedSatId] = useState(null);
-  const [hoveredSatId, setHoveredSatId] = useState(null);
-  const [deferredHoverId, setDeferredHoverId] = useState(null);
-
-  useEffect(() => {
-    if (hoveredSatId) {
-      setDeferredHoverId(hoveredSatId);
-    } else {
-      const timer = setTimeout(() => setDeferredHoverId(null), 350); // Keep alive for exit animation
-      return () => clearTimeout(timer);
-    }
-  }, [hoveredSatId]);
-
-  const [navMode, setNavMode] = useState('PAN'); // Default to PAN mode
-  const [selectedSatPos, setSelectedSatPos] = useState(null);
+  const selectedSat = useMemo(() => selectedSatId === null ? null : satellites.find(s => s.id === selectedSatId),
+    [satellites, selectedSatId]);
+  const selectedRecord = useMemo(() => selectedSat && createSatrec(selectedSat), [selectedSat]);
+  const [navMode, setAppNavMode] = useState('PAN');
+  const currentNavMode = useRef('PAN');
+  const setNavMode = useCallback((mode) => {
+    currentNavMode.current = mode;
+    setAppNavMode(mode);
+  }, []);
+  const selectedSatPos = useRef(null);
   const [search, setSearch] = useState('');
   const [speed, setAppSpeed] = useState(1);
   const [paused, setAppPaused] = useState(false);
   const [showModeHint, setShowModeHint] = useState(false);
   const [modeHintExiting, setModeHintExiting] = useState(false);
+  const hintTimers = useRef([]);
+
+  useEffect(() => () => {
+    for (const timer of hintTimers.current) clearTimeout(timer);
+  }, []);
+
+  const handleSatelliteClick = useCallback((id) => {
+    if (currentNavMode.current === 'SELECT') {
+      setSelectedSatId(id);
+      setNavMode('PAN');
+      return;
+    }
+    for (const timer of hintTimers.current) clearTimeout(timer);
+    setShowModeHint(true);
+    setModeHintExiting(false);
+    hintTimers.current = [
+      setTimeout(() => setModeHintExiting(true), 5000),
+      setTimeout(() => setShowModeHint(false), 5300)
+    ];
+  }, [setNavMode]);
 
   // Loading Screen State Management
   const [showLoadingScreen, setShowLoadingScreen] = useState(true);
   const [isExiting, setIsExiting] = useState(false);
   const [animationComplete, setAnimationComplete] = useState(false);
-  const [loadStartTime] = useState(Date.now());
+  const [loadStartTime] = useState(Date.now);
 
   useEffect(() => {
     // Ensure loading screen shows for minimum 2 seconds for smooth UX
@@ -371,27 +382,17 @@ function App() {
   };
 
   const setSpeed = (s) => {
-    SIM_STATE.speed = s;
+    setSimulationSpeed(s);
     setAppSpeed(s);
   };
 
   const setPaused = (p) => {
-    SIM_STATE.paused = p;
+    setSimulationPaused(p);
     setAppPaused(p);
   };
 
-  // Auto-switch to PAN mode after selecting a satellite
-  const prevSelectedSatId = useRef(null);
-  useEffect(() => {
-    // Only auto-switch if a NEW satellite was selected (not on manual mode change)
-    if (selectedSatId && selectedSatId !== prevSelectedSatId.current && navMode === 'SELECT') {
-      setNavMode('PAN');
-    }
-    prevSelectedSatId.current = selectedSatId;
-  }, [selectedSatId, navMode]);
-
   const resetToRealTime = () => {
-    SIM_STATE.simTime = Date.now();
+    resetSimulationTime();
     setSpeed(1);
     setPaused(false);
   };
@@ -400,11 +401,12 @@ function App() {
     window.dispatchEvent(new CustomEvent('nav-zoom', { detail: { factor, reset } }));
   };
 
-  // ONLY filter by search for the rendering list
-  // The category filtering is now handled visually via opacity
-  const filteredSats = satellites.filter(s => {
-    if (search.trim()) {
-      const query = search.toLowerCase();
+  const searchResults = useMemo(() => {
+    if (!search.trim()) return [];
+    const matches = [];
+    const query = search.toLowerCase();
+    const cleanQuery = query.replace(/[-\s]/g, '');
+    for (const s of satellites) {
 
       // Basic checks
       const nameMatch = s.name.toLowerCase().includes(query);
@@ -413,7 +415,6 @@ function App() {
       // Advanced TLE checks (on-the-fly extract)
       let noradMatch = false;
       let intlMatch = false;
-      const cleanQuery = query.replace(/[-\s]/g, '');
 
       if (s.tle2 && s.tle2.length > 7) {
         // Standard TLE Line 2 NORAD ID is cols 2-7
@@ -442,15 +443,16 @@ function App() {
         }
       }
 
-      return nameMatch || idMatch || noradMatch || intlMatch;
+      if (nameMatch || idMatch || noradMatch || intlMatch) {
+        matches.push(s);
+        if (matches.length === 15) break;
+      }
     }
-    return true;
-  });
-
-  const searchResults = search.trim() ? filteredSats.slice(0, 15) : [];
+    return matches;
+  }, [satellites, search]);
 
   return (
-    <div className={`app-container ${!showLoadingScreen ? 'app-ready' : ''}`} style={{ width: '100%', height: '100vw', minHeight: '100vh', background: '#111', color: '#fff' }}>
+    <div className={`app-container ${!showLoadingScreen ? 'app-ready' : ''}`} style={{ width: '100%', height: '100dvh', background: '#111', color: '#fff' }}>
       <NavControls
         activeMode={navMode}
         setMode={setNavMode}
@@ -669,7 +671,7 @@ function App() {
           </div>
         </div>
 
-        <TelemetryPanel key={selectedSatId} selectedSatId={selectedSatId} satellites={satellites} />
+        <TelemetryPanel key={selectedSatId} selectedSat={selectedSat} satrec={selectedRecord} />
 
         {selectedSatId && (
           <>
@@ -677,20 +679,20 @@ function App() {
               <div className="reveal-item stagger-9">
                 <button
                   className="btn-interactive"
-                  onClick={() => { setSelectedSatId(null); setSelectedSatPos(null); }}
+                  onClick={() => setSelectedSatId(null)}
                   style={{ background: 'none', border: '1px solid #333', color: '#fff', fontSize: '10px', fontFamily: 'Unbounded', padding: '6px', width: '100%', borderRadius: '4px', marginTop: '10px', cursor: 'pointer' }}
                 >
                   UNFOCUS
                 </button>
               </div>
             </div>
-            <HistoricalPanel key={`${selectedSatId}-history`} selectedSat={satellites.find(s => s.id === selectedSatId)} />
+            <HistoricalPanel key={`${selectedSatId}-history`} selectedSat={selectedSat} />
           </>
         )}
       </div>
 
       <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 1 }}>
-        <Canvas camera={{ position: [0, 0, 3], fov: 45 }} raycaster={{ params: { Points: { threshold: 0.1 } } }}>
+        <Canvas camera={{ position: [0, 0, 3], fov: 45 }}>
           <color attach="background" args={['#111']} />
           <SimulationManager />
           <SunLight />
@@ -699,69 +701,23 @@ function App() {
           <SatellitesInstanced
             satellites={satellites}
             selectedSatId={selectedSatId}
-            hoveredSatId={hoveredSatId}
             categoryFilters={categoryFilters}
-            onClick={(id) => {
-              console.log('[CLICK] Satellite clicked, navMode:', navMode);
-              if (navMode === 'SELECT') {
-                setSelectedSatId(id);
-              } else {
-                // Show hint when trying to click in PAN mode
-                console.log('[MODE HINT] Showing notification - clicked in PAN mode');
-                setShowModeHint(true);
-                setModeHintExiting(false);
-                setTimeout(() => {
-                  setModeHintExiting(true);
-                  setTimeout(() => setShowModeHint(false), 300);
-                }, 5000);
-              }
-            }}
-            onHover={setHoveredSatId}
-            navMode={navMode}
+            onClick={handleSatelliteClick}
           />
 
           {/* Selected Satellite Rendering */}
-          {selectedSatId && satellites.find(s => s.id === selectedSatId) && (
+          {selectedRecord && (
             <Satellite
               key={`selected-${selectedSatId}`}
-              {...satellites.find(s => s.id === selectedSatId)}
+              {...selectedSat}
+              satrec={selectedRecord}
               isSelected={true}
-              isVisible={true} // Selected satellite always visible
-              onClick={() => { }}
-              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === selectedSatId).tle2, satellites.find(s => s.id === selectedSatId).omm)}
-              onUpdatePosition={setSelectedSatPos}
-              navMode={navMode}
+              orbitalPeriod={getOrbitalPeriod(selectedSat.tle2, selectedSat.omm)}
+              targetRef={selectedSatPos}
             />
           )}
 
-          {/* Hovered Satellite Rendering (only if not selected) */}
-          {deferredHoverId && deferredHoverId !== selectedSatId && satellites.find(s => s.id === deferredHoverId) && (
-            <Satellite
-              key={`hover-${deferredHoverId}`}
-              {...satellites.find(s => s.id === deferredHoverId)}
-              isSelected={false}
-              isHovered={deferredHoverId === hoveredSatId}
-              isVisible={categoryFilters[satellites.find(s => s.id === deferredHoverId)?.category] !== false}
-              onClick={() => {
-                if (navMode === 'SELECT') {
-                  setSelectedSatId(deferredHoverId);
-                } else {
-                  console.log('[MODE HINT] Showing notification - clicked hover satellite in PAN mode');
-                  setShowModeHint(true);
-                  setModeHintExiting(false);
-                  setTimeout(() => {
-                    setModeHintExiting(true);
-                    setTimeout(() => setShowModeHint(false), 300);
-                  }, 5000);
-                }
-              }}
-              orbitalPeriod={getOrbitalPeriod(satellites.find(s => s.id === deferredHoverId).tle2, satellites.find(s => s.id === deferredHoverId).omm)}
-              onUpdatePosition={null}
-              navMode={navMode}
-            />
-          )}
-
-          <CameraController targetPosition={selectedSatPos} isSelected={!!selectedSatId} />
+          <CameraController targetRef={selectedSatPos} isSelected={Boolean(selectedRecord)} />
           <OrbitControls
             makeDefault
             enablePan={navMode === 'PAN'}

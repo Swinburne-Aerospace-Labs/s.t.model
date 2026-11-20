@@ -1,23 +1,20 @@
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect } from 'react';
 import { easing } from 'maath';
 
-const CameraController = ({ targetPosition, isSelected }) => {
+const ORIGIN = new THREE.Vector3();
+const idealPosition = new THREE.Vector3();
+
+const CameraController = ({ targetRef, isSelected }) => {
     const { camera, controls } = useThree();
-    const [autoZoomActive, setAutoZoomActive] = useState(false);
 
     // Zoom state
     const targetDistance = useRef(camera.position.length());
 
     useEffect(() => {
-        if (isSelected) {
-            setAutoZoomActive(true);
-            targetDistance.current = 0.5; // Reset zoom to comfortable level on selection
-        } else {
-            setAutoZoomActive(false);
-        }
-    }, [isSelected, !!targetPosition]);
+        if (isSelected) targetDistance.current = 0.5;
+    }, [isSelected]);
 
     // Handle smooth scroll wheel zoom AND custom events
     useEffect(() => {
@@ -45,19 +42,16 @@ const CameraController = ({ targetPosition, isSelected }) => {
     }, []);
 
     useFrame((state, delta) => {
-        // Handle Target Easing (Always active when selected)
-        if (isSelected && targetPosition && controls) {
+        const targetPosition = isSelected ? targetRef.current : ORIGIN;
+        if (controls && targetPosition) {
             easing.damp3(controls.target, targetPosition, 0.15, delta);
-        } else if (!isSelected && controls) {
-            easing.damp3(controls.target, new THREE.Vector3(0, 0, 0), 0.15, delta);
         }
 
         // Handle Smooth Zoom Easing (Radius control)
-        const center = controls ? controls.target : new THREE.Vector3(0, 0, 0);
-        const direction = camera.position.clone().sub(center).normalize();
-        const idealPos = center.clone().add(direction.multiplyScalar(targetDistance.current));
+        const center = controls ? controls.target : ORIGIN;
+        idealPosition.copy(camera.position).sub(center).normalize().multiplyScalar(targetDistance.current).add(center);
 
-        easing.damp3(camera.position, idealPos, 0.25, delta);
+        easing.damp3(camera.position, idealPosition, 0.25, delta);
     });
 
     return null;

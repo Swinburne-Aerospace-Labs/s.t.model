@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react';
-import * as satellite from 'satellite.js';
 
 const FIELDS = ['NORAD_CAT_ID', 'OBJECT_NAME', 'OBJECT_ID', 'OBJECT_TYPE', 'EPOCH', 'MEAN_MOTION', 'ECCENTRICITY', 'INCLINATION', 'RA_OF_ASC_NODE', 'ARG_OF_PERICENTER', 'MEAN_ANOMALY', 'BSTAR', 'MEAN_MOTION_DOT', 'MEAN_MOTION_DDOT'];
 const EXPIRY = 12 * 60 * 60 * 1000;
@@ -30,14 +29,15 @@ function processCatalog(rows, source) {
         if (source === 'spacebook') {
             const [id, name, tle1, tle2] = row;
             const category = /^(ISS |CSS |TIANGONG)/i.test(name) ? 'STATION' : /\bDEB\b|R\/B/i.test(name) ? 'DEBRIS' : 'PAYLOAD';
-            return { id: String(id), name, category, tle1, tle2, satrec: satellite.twoline2satrec(tle1, tle2) };
+            return { id: String(id), name, category, tle1, tle2 };
         }
-        const omm = Object.fromEntries(FIELDS.map((field, index) => [field, row[index]]));
+        const omm = {};
+        for (let i = 0; i < FIELDS.length; i++) omm[FIELDS[i]] = row[i];
         const name = omm.OBJECT_NAME || `OBJECT ${omm.NORAD_CAT_ID}`;
         const type = (omm.OBJECT_TYPE || '').toUpperCase();
         const category = /^(ISS |CSS |TIANGONG)/i.test(name) ? 'STATION' :
             (type === 'DEBRIS' || type === 'ROCKET BODY' || /\bDEB\b|R\/B/i.test(name)) ? 'DEBRIS' : 'PAYLOAD';
-        return { id: String(omm.NORAD_CAT_ID), name, category, omm, satrec: satellite.json2satrec(omm) };
+        return { id: String(omm.NORAD_CAT_ID), name, category, omm };
     });
 }
 export const useSatelliteData = () => {
@@ -50,11 +50,17 @@ export const useSatelliteData = () => {
         async function load() {
             let cached;
             try { cached = await cacheOperation('readonly'); } catch (err) { console.warn('Catalog cache unavailable', err); }
+            if (cancelled) return;
+            if (cancelled) return;
             const valid = ['spacebook', 'celestrak-active'].includes(cached?.source) && Array.isArray(cached.satellites) && cached.satellites.length >= (cached.source === 'spacebook' ? 10000 : 1);
             if (!valid) cached = null;
             const show = (data, label) => {
+                if (cancelled) return;
                 const processed = processCatalog(data.satellites, data.source);
-                if (!cancelled) { setSatellites(processed); setStatus(`${data.source === 'celestrak-active' ? 'PARTIAL ACTIVE CATALOG' : label}: ${processed.length.toLocaleString()} OBJECTS`); setLoading(false); setError(null); }
+                setSatellites(processed);
+                setStatus(`${data.source === 'celestrak-active' ? 'PARTIAL ACTIVE CATALOG' : label}: ${processed.length.toLocaleString()} OBJECTS`);
+                setLoading(false);
+                setError(null);
             };
             if (valid) {
                 try { show(cached, !cached.stale && Date.now() - cached.timestamp < EXPIRY ? 'CACHED' : 'STALE CACHE'); }
