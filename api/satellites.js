@@ -2,12 +2,17 @@ import process from 'node:process';
 import fs from 'fs';
 import path from 'path';
 import { gzipSync } from 'node:zlib';
+import { catalogKey } from '../src/services/catalog.js';
 
 const CACHE_DURATION = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
 const CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-spacebook-cache-v1.json');
 const FALLBACK_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-cache-v1.json');
+const OBJECT_TYPES_CACHE_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-object-types-v1.json');
 let refreshPromise;
 let fallbackPromise;
+let objectTypesPromise;
+let objectTypesCache;
+let nextObjectTypesAttempt = 0;
 const RATE_LIMIT_FILE = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'satellite-active-rate-limit.json');
 const RATE_LIMIT_DELAY = 2 * 60 * 60 * 1000;
 
@@ -75,6 +80,21 @@ export async function fetchFullCatalog() {
     return parseTleCatalog(await response.text());
 }
 
+export function parseObjectTypes(csv) {
+    const [header, ...rows] = csv.trim().split(/\r?\n/);
+    if (!header.startsWith('OBJECT_NAME,OBJECT_ID,NORAD_CAT_ID,OBJECT_TYPE,')) {
+        throw new Error('Unexpected CelesTrak SATCAT format');
+    }
+    const entries = [];
+    for (const row of rows) {
+        // The name can be quoted and contain commas or escaped quotes.
+        const match = /^(?:"(?:[^"]|"")*"|[^,]*),[^,]*,(\d+),(PAY|R\/B|DEB),/.exec(row);
+        if (match) entries.push([catalogKey(match[1]), match[2]]);
+    }
+    if (!entries.length) throw new Error('CelesTrak SATCAT contains no object types');
+    return entries;
+}
+
 const loadCache = (file = CACHE_FILE, source = 'spacebook') => {
     try {
         if (fs.existsSync(file)) {
@@ -108,6 +128,36 @@ const saveCache = (data, file = CACHE_FILE, source = 'spacebook') => {
     }
 };
 
+async function loadObjectTypes() {
+    const source = 'celestrak-satcat';
+    if (objectTypesCache === undefined) {
+        const cached = loadCache(OBJECT_TYPES_CACHE_FILE, source);
+        objectTypesCache = null;
+        if (cached?.data.every(entry => Array.isArray(entry) && entry.length === 2)) {
+            objectTypesCache = new Map(cached.data);
+            nextObjectTypesAttempt = cached.timestamp + CACHE_DURATION;
+        }
+    }
+    if (Date.now() < nextObjectTypesAttempt) return objectTypesCache;
+    if (!objectTypesPromise) {
+        objectTypesPromise = (async () => {
+            try {
+                const response = await fetch('https://celestrak.org/pub/satcat.csv', { signal: AbortSignal.timeout(8000) });
+                if (!response.ok) throw new Error(`CelesTrak SATCAT request failed (HTTP ${response.status})`);
+                const data = parseObjectTypes(await response.text());
+                objectTypesCache = new Map(data);
+                nextObjectTypesAttempt = Date.now() + CACHE_DURATION;
+                saveCache(data, OBJECT_TYPES_CACHE_FILE, source);
+            } catch (error) {
+                console.error('[API] Object type refresh failed:', error.message);
+                nextObjectTypesAttempt = Date.now() + RATE_LIMIT_DELAY;
+            }
+            return objectTypesCache;
+        })().finally(() => { objectTypesPromise = null; });
+    }
+    return objectTypesPromise;
+}
+
 export default async function handler(req, res) {
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -122,7 +172,17 @@ export default async function handler(req, res) {
         return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    const sendCatalog = payload => {
+    const sendCatalog = async payload => {
+        if (payload.source === 'spacebook') {
+            const types = await loadObjectTypes();
+            if (types) {
+                payload.hasObjectTypes = true;
+                payload.satellites = payload.satellites.map(row => {
+                    const type = types.get(catalogKey(row[0]));
+                    return type ? [...row, type] : row;
+                });
+            }
+        }
         res.setHeader('Cache-Control', 'no-store');
         if (/\bgzip\b/.test(req.headers?.['accept-encoding'] || '')) {
             res.setHeader('Content-Encoding', 'gzip');
@@ -136,21 +196,21 @@ export default async function handler(req, res) {
     try {
         const cached = loadCache();
         if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-            return sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, timestamp: cached.timestamp });
+            return await sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, timestamp: cached.timestamp });
         }
         try {
             if (!refreshPromise) refreshPromise = fetchFullCatalog().finally(() => { refreshPromise = null; });
             const data = await refreshPromise;
             if (cached && data.length < cached.data.length * 0.8) throw new Error('Catalog shrank unexpectedly');
             saveCache(data);
-            return sendCatalog({ satellites: data, source: 'spacebook', cached: false, timestamp: Date.now() });
+            return await sendCatalog({ satellites: data, source: 'spacebook', cached: false, timestamp: Date.now() });
         } catch (error) {
             console.error('[API] Catalog refresh failed:', error.message);
-            if (cached) return sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, stale: true, timestamp: cached.timestamp });
+            if (cached) return await sendCatalog({ satellites: cached.data, source: 'spacebook', cached: true, stale: true, timestamp: cached.timestamp });
             // Active satellites are a subset, so never label or save this as a full catalog.
             const fallback = loadCache(FALLBACK_CACHE_FILE, 'celestrak-active');
             if (fallback && Date.now() - fallback.timestamp < CACHE_DURATION) {
-                return sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, timestamp: fallback.timestamp });
+                return await sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, timestamp: fallback.timestamp });
             }
             try {
                 let blockedUntil = 0;
@@ -159,10 +219,10 @@ export default async function handler(req, res) {
                 if (!fallbackPromise) fallbackPromise = fetchActiveCatalog().finally(() => { fallbackPromise = null; });
                 const data = await fallbackPromise;
                 saveCache(data, FALLBACK_CACHE_FILE, 'celestrak-active');
-                return sendCatalog({ satellites: data, source: 'celestrak-active', cached: false, timestamp: Date.now() });
+                return await sendCatalog({ satellites: data, source: 'celestrak-active', cached: false, timestamp: Date.now() });
             } catch (fallbackError) {
                 console.error('[API] Active catalog failed:', fallbackError.message);
-                if (fallback) return sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, stale: true, timestamp: fallback.timestamp });
+                if (fallback) return await sendCatalog({ satellites: fallback.data, source: 'celestrak-active', cached: true, stale: true, timestamp: fallback.timestamp });
                 return res.status(503).json({ error: `Spacebook: ${error.message}. CelesTrak: ${fallbackError.message}` });
             }
         }

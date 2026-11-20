@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
+import { processCatalog } from '../services/catalog';
 
-const FIELDS = ['NORAD_CAT_ID', 'OBJECT_NAME', 'OBJECT_ID', 'OBJECT_TYPE', 'EPOCH', 'MEAN_MOTION', 'ECCENTRICITY', 'INCLINATION', 'RA_OF_ASC_NODE', 'ARG_OF_PERICENTER', 'MEAN_ANOMALY', 'BSTAR', 'MEAN_MOTION_DOT', 'MEAN_MOTION_DDOT'];
 const EXPIRY = 12 * 60 * 60 * 1000;
 
 function database() {
@@ -24,22 +24,6 @@ async function cacheOperation(mode, value) {
         });
     } finally { db.close(); }
 }
-function processCatalog(rows, source) {
-    return rows.map(row => {
-        if (source === 'spacebook') {
-            const [id, name, tle1, tle2] = row;
-            const category = /^(ISS |CSS |TIANGONG)/i.test(name) ? 'STATION' : /\bDEB\b|R\/B/i.test(name) ? 'DEBRIS' : 'PAYLOAD';
-            return { id: String(id), name, category, tle1, tle2 };
-        }
-        const omm = {};
-        for (let i = 0; i < FIELDS.length; i++) omm[FIELDS[i]] = row[i];
-        const name = omm.OBJECT_NAME || `OBJECT ${omm.NORAD_CAT_ID}`;
-        const type = (omm.OBJECT_TYPE || '').toUpperCase();
-        const category = /^(ISS |CSS |TIANGONG)/i.test(name) ? 'STATION' :
-            (type === 'DEBRIS' || type === 'ROCKET BODY' || /\bDEB\b|R\/B/i.test(name)) ? 'DEBRIS' : 'PAYLOAD';
-        return { id: String(omm.NORAD_CAT_ID), name, category, omm };
-    });
-}
 export const useSatelliteData = () => {
     const [satellites, setSatellites] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -50,7 +34,6 @@ export const useSatelliteData = () => {
         async function load() {
             let cached;
             try { cached = await cacheOperation('readonly'); } catch (err) { console.warn('Catalog cache unavailable', err); }
-            if (cancelled) return;
             if (cancelled) return;
             const valid = ['spacebook', 'celestrak-active'].includes(cached?.source) && Array.isArray(cached.satellites) && cached.satellites.length >= (cached.source === 'spacebook' ? 10000 : 1);
             if (!valid) cached = null;
@@ -66,7 +49,7 @@ export const useSatelliteData = () => {
                 try { show(cached, !cached.stale && Date.now() - cached.timestamp < EXPIRY ? 'CACHED' : 'STALE CACHE'); }
                 catch (err) { console.warn('Catalog cache invalid', err); cached = null; }
             }
-            if (valid && cached?.source === 'spacebook' && !cached.stale && Date.now() - cached.timestamp < EXPIRY) return;
+            if (cached?.source === 'spacebook' && cached.hasObjectTypes && !cached.stale && Date.now() - cached.timestamp < EXPIRY) return;
             try {
                 const response = await fetch('/api/satellites', { signal: AbortSignal.timeout(65000) });
                 const result = await response.json();
@@ -75,6 +58,13 @@ export const useSatelliteData = () => {
                 if (valid && cached?.source === 'spacebook' && result.source !== 'spacebook') {
                     if (!cancelled) setStatus(`OFFLINE: STALE CATALOG (${cached.satellites.length.toLocaleString()} OBJECTS)`);
                     return;
+                }
+                if (result.source === 'spacebook' && !result.hasObjectTypes && cached?.source === 'spacebook') {
+                    const lastKnownTypes = new Map(cached.satellites.filter(row => row[4]).map(row => [row[0], row[4]]));
+                    result.satellites = result.satellites.map(row => {
+                        const type = lastKnownTypes.get(row[0]);
+                        return type ? [...row, type] : row;
+                    });
                 }
                 show(result, result.stale ? 'STALE CACHE' : 'ACTIVE');
                 try { await cacheOperation('readwrite', result); } catch (err) { console.warn('Could not save catalog', err); }
