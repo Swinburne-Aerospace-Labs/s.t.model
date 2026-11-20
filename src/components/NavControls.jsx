@@ -30,8 +30,8 @@ const NavControls = ({ activeMode, setMode, onZoomIn, onZoomOut, onResetZoom }) 
         flexDirection: 'column',
         alignItems: 'center',
         justifyContent: 'center',
-        width: '42px',
-        height: '42px',
+        width: '52px',
+        height: '52px',
         border: 'none',
         borderRadius: '6px',
         cursor: 'pointer',
@@ -52,10 +52,13 @@ const NavControls = ({ activeMode, setMode, onZoomIn, onZoomOut, onResetZoom }) 
     };
 
     const labelStyle = {
-        fontSize: '7px',
-        fontWeight: '800',
+        fontFamily: 'Unbounded, sans-serif',
+        fontSize: '10px',
+        fontWeight: '700',
         letterSpacing: '0.08em',
-        textTransform: 'uppercase'
+        textTransform: 'uppercase',
+        lineHeight: 1,
+        transform: 'scale(0.7)'
     };
 
     return (
